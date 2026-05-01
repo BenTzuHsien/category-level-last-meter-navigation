@@ -44,10 +44,9 @@ class ObjectCentricLocalNavigation:
 
     def _predict(self, observation):
 
-        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-            with torch.no_grad():
-                output_logist, current_box, _ = self._model(observation, self._goal_images, self._prompt)
-                prediction = torch.argmax(output_logist, dim=2).flatten()
+        with torch.no_grad():
+            output_logist, current_box, _ = self._model(observation, self._goal_images, self._prompt)
+            prediction = torch.argmax(output_logist, dim=2).flatten()
 
         return prediction, current_box.squeeze(0)
     
@@ -84,7 +83,7 @@ class ObjectCentricLocalNavigation:
         goal_images : list
             A list of PIL Image objects representing the goal state. These images
             are used by the model to identify the target object and location.
-        target_object : str
+        target_object_prompt : str
             A text prompt (e.g., 'chair', 'table') that specifies the object to
             navigate to. This prompt is used by the segmentation model.
         """
@@ -140,12 +139,13 @@ if __name__ == '__main__':
     print(f'Target Object: {prompt}')
 
     try:
+        lease_client.take()
         with LeaseKeepAlive(lease_client, must_acquire=True, return_at_exit=True):
             try:
                 rollout_model = ObjectCentricLocalNavigation(MODEL, WEIGHT, robot)
                 rollout_model.run(goal_images, prompt)
 
-            except Exception as exc:  # pylint: disable=broad-except
+            except Exception as exc:
                 print("ObjectCentricLocalNavigation threw an error.")
                 print(exc)
             finally:

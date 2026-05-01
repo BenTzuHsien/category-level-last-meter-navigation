@@ -14,7 +14,7 @@ SAM2_MODEL_CONFIG = "configs/sam2.1/sam2.1_hiera_l.yaml"
 SAM2_CHECKPOINT = os.path.expanduser("/opt/Grounded-SAM-2/checkpoints/sam2.1_hiera_large.pt")
 
 class GroundedSAM2(nn.Module):
-    BOX_THRESHOLD = 0.45
+    BOX_THRESHOLD = 0.1
     TEXT_THRESHOLD = 0.4
 
     def __init__(self):
@@ -53,7 +53,7 @@ class GroundedSAM2(nn.Module):
 
         # IoU
         iou = inter_area / union_area
-        return iou.item()
+        return iou
     
     @staticmethod
     def mask_to_bounding_box(mask):
@@ -81,6 +81,40 @@ class GroundedSAM2(nn.Module):
         x_max = nonzero[:, 1].max()
 
         return torch.tensor([x_min, y_min, x_max, y_max]).to(mask)
+    
+    def _merge_overlapping_boxes_keep_largest(self, boxes, scale):
+
+        keep = [True] * len(boxes)
+
+        for i in range(len(boxes)):
+            if not keep[i]:
+                continue
+            
+            for j in range(i + 1, len(boxes)):
+                if not keep[j]:
+                    continue
+
+                box1 = box_convert(boxes[i] * scale, in_fmt="cxcywh", out_fmt="xyxy")
+                box2 = box_convert(boxes[j] * scale, in_fmt="cxcywh", out_fmt="xyxy")
+
+                if self.calculate_iou(box1, box2) > 0:
+                    area_i = (box1[2]-box1[0]) * (box1[3]-box1[1])
+                    area_j = (box2[2]-box2[0]) * (box2[3]-box2[1])
+
+                    if area_i >= area_j:
+                        keep[j] = False
+                    else:
+                        keep[i] = False
+                        break
+        filtered_boxes = [b for k, b in zip(keep, boxes) if k]
+        return filtered_boxes
+    
+    def _get_best_box(self, boxes, scale, confidences):
+
+        boxes = self._merge_overlapping_boxes_keep_largest(boxes, scale)
+        best_box = boxes[confidences.argmax()]
+
+        return best_box
 
     @torch.no_grad() 
     def forward(self, batch_images, prompts, previous_bounding_box=None):
@@ -114,54 +148,45 @@ class GroundedSAM2(nn.Module):
             Tensor of shape (B, 1, H, W) with binary masks (values 0 or 1).  
             If no detection was found for an image, the mask is all zeros.
         """
-        batch_size, _, H, W = batch_images.shape
+        with torch.autocast(device_type=batch_images.device.type, enabled=False):
+            batch_images = batch_images.float()
+            batch_size, _, H, W = batch_images.shape
 
-        # Grounding‑DINO
-        boxes_list, confidences_list, labels_list = self.gdino_predictor.predict(batch_images, prompts, self.BOX_THRESHOLD, self.TEXT_THRESHOLD)
+            # Grounding‑DINO
+            boxes_list, confidences_list, labels_list = self.gdino_predictor.predict(batch_images, prompts, self.BOX_THRESHOLD, self.TEXT_THRESHOLD)
 
-        # Extract SAM2 Embeddings
-        batch_image_embed, batch_high_res_feats_split = self.sam2_predictor.extract_features(batch_images)
-        
-        empty_box = torch.zeros([4]).to(batch_images)
-        empty_mask = torch.zeros([1, H, W]).to(batch_images)
-        bounding_boxes = []
-        masks = []
-        scale = torch.tensor([W, H, W, H], device=self.device, dtype=self.dtype)
-        for i in range(batch_size):
-            if boxes_list[i].numel() == 0:
-                bounding_boxes.append(empty_box)
-                masks.append(empty_mask)
-            else:
-                # Get the best box
-                if previous_bounding_box is None:
-                    best_box = boxes_list[i][confidences_list[i].argmax()]
+            # Extract SAM2 Embeddings
+            batch_image_embed, batch_high_res_feats_split = self.sam2_predictor.extract_features(batch_images)
+            
+            empty_box = torch.zeros([4]).to(batch_images)
+            empty_mask = torch.zeros([1, H, W]).to(batch_images)
+            bounding_boxes = []
+            masks = []
+            scale = torch.tensor([W, H, W, H], device=self.device, dtype=self.dtype)
+            for i in range(batch_size):
+                if boxes_list[i].numel() == 0:
+                    bounding_boxes.append(empty_box)
+                    masks.append(empty_mask)
                 else:
-                    best_iou = 0
-                    best_index = 0
-                    for index, box in enumerate(boxes_list[i]):
-                        box = box_convert(box * scale, in_fmt="cxcywh", out_fmt="xyxy")
-                        iou = self.calculate_iou(previous_bounding_box, box)
-                        if iou > best_iou:
-                            best_iou = iou
-                            best_index = index
-                    best_box = boxes_list[i][best_index]
-                box_xyxy = box_convert(best_box * scale, in_fmt="cxcywh", out_fmt="xyxy")
+                    # Get the best box
+                    best_box = self._get_best_box(boxes_list[i], scale, confidences_list[i])
+                    box_xyxy = box_convert(best_box * scale, in_fmt="cxcywh", out_fmt="xyxy")
 
-                # Predict the mask from the best box
-                image_mask, _, _ = self.sam2_predictor.predict_once(
-                    batch_image_embed[i].unsqueeze(0), 
-                    batch_high_res_feats_split[i],
-                    (H, W),
-                    boxes=box_xyxy.unsqueeze(0), 
-                    multimask_output=False)
-                
-                image_mask = image_mask.float().squeeze(0)
-                masks.append(image_mask)
-                best_box = self.mask_to_bounding_box(image_mask)
-                bounding_boxes.append(best_box)
+                    # Predict the mask from the best box
+                    image_mask, _, _ = self.sam2_predictor.predict_once(
+                        batch_image_embed[i].unsqueeze(0), 
+                        batch_high_res_feats_split[i],
+                        (H, W),
+                        boxes=box_xyxy.unsqueeze(0), 
+                        multimask_output=False)
+                    
+                    image_mask = image_mask.float().squeeze(0)
+                    masks.append(image_mask)
+                    best_box = self.mask_to_bounding_box(image_mask)
+                    bounding_boxes.append(best_box)
 
-        bounding_boxes = torch.stack(bounding_boxes)
-        masks = torch.stack(masks)
+            bounding_boxes = torch.stack(bounding_boxes)
+            masks = torch.stack(masks)
         return bounding_boxes, masks
     
     @property

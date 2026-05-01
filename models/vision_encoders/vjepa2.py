@@ -34,19 +34,21 @@ class Vjepa2(torch.nn.Module):
                 - P = `PATCH_NUM` (number of patches per spatial axis after resizing)
             Each embedding corresponds to a specific spatial patch in the input image.
         """
-        batch_size = batch_images.shape[0]
-        # batch_images = resize_and_normalize_tensor(batch_images, self.TRANSFORM_SIZE, self.TRANSFORM_MEAN, self.TRANSFORM_STD)
+        with torch.autocast(device_type=batch_images.device.type, enabled=False):
+            batch_images = batch_images.float()
+            batch_size = batch_images.shape[0]
+            # batch_images = resize_and_normalize_tensor(batch_images, self.TRANSFORM_SIZE, self.TRANSFORM_MEAN, self.TRANSFORM_STD)
 
-        # Preprocess images 
-        batch_images_processed = []
-        for image in batch_images:
-            image = image.unsqueeze(0).expand(2, -1, -1, -1)
-            image = self.processor(image)[0]
-            batch_images_processed.append(image)
-        
-        batch_images_processed = torch.stack(batch_images_processed)
-        vjepa_output = self.vjepa2(batch_images_processed)
-        batch_embeddings = vjepa_output.reshape(batch_size, self.PATCH_NUM, self.PATCH_NUM, self.EMBED_DIM).permute(0, 3, 1, 2)
+            # Preprocess images 
+            batch_images_processed = []
+            for image in batch_images:
+                image = image.unsqueeze(0).expand(2, -1, -1, -1)
+                image = self.processor(image)[0]
+                batch_images_processed.append(image)
+            
+            batch_images_processed = torch.stack(batch_images_processed)
+            vjepa_output = self.vjepa2(batch_images_processed)
+            batch_embeddings = vjepa_output.reshape(batch_size, self.PATCH_NUM, self.PATCH_NUM, self.EMBED_DIM).permute(0, 3, 1, 2)
 
         return batch_embeddings
         

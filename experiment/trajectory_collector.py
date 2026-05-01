@@ -77,18 +77,16 @@ if __name__ == '__main__':
 
     # Map 1
     # radii 1.2, 0.9, 0.6, 0.45, 0.3
-    # radii = [1.2]
-    # angles = [90, 75, 60, 45, 30, 15, 0]
+    radii = [1.2]
+    angles = [90, 75, 60, 45, 30, 15, 0]
     # angles = [-15, -30, -45, -60, -75, -90]
-    # orientations = [150, 120, 90, 60, 30, 0, -30, -60, -90, -120, -150]
+    orientations = [150, 120, 90, 60, 30, 0, -30, -60, -90, -120, -150]
 
     # Map 2
     # radii 1.0, 0.8, 0.5
-    radii = [0.5]
-    angles = [80, 50, 25, 0, -25, -50, -80]
-    orientations = [135, 90, 45, 0, -45, -90, -135]
-
-    # Map3 = Map2 + New environment
+    # radii = [0.5]
+    # angles = [80, 50, 25, 0, -25, -50, -80]
+    # orientations = [135, 90, 45, 0, -45, -90, -135]
 
     import argparse, bosdyn.client.util, sys, time
     from bosdyn.client.lease import LeaseClient, LeaseKeepAlive, ResourceAlreadyClaimedError
@@ -106,10 +104,12 @@ if __name__ == '__main__':
     sdk = bosdyn.client.create_standard_sdk('TrajectoryCollector')
     robot = sdk.create_robot(options.hostname)
     bosdyn.client.util.authenticate(robot)
+    robot.time_sync.wait_for_sync()
     lease_client = robot.ensure_client(LeaseClient.default_service_name)
     graph_path = options.graph_path
 
     try:
+        lease_client.take()
         with LeaseKeepAlive(lease_client, must_acquire=True, return_at_exit=True):
             try:
                 trajectory_collector = TrajectoryCollector(robot, graph_path)
@@ -149,7 +149,7 @@ if __name__ == '__main__':
                             traj_num += 1
                             time.sleep(1.5)
 
-            except Exception as exc:  # pylint: disable=broad-except
+            except Exception as exc:
                 print("TrajectoryCollector threw an error.")
                 print(exc)
             finally:

@@ -18,7 +18,7 @@ class DinoV2(torch.nn.Module):
     @torch.no_grad() 
     def forward(self, batch_images):
         """
-        Extract DINOv2 ebeddings
+        Extract DINOv2 embeddings
 
         Parameters
         ----------
@@ -33,10 +33,12 @@ class DinoV2(torch.nn.Module):
                 - P = `PATCH_NUM` (number of patches per spatial axis after resizing)
             Each embedding corresponds to a specific spatial patch in the input image.
         """
+        with torch.autocast(device_type=batch_images.device.type, enabled=False):
+            batch_images = batch_images.float()
 
-        batch_images = resize_and_normalize_tensor(batch_images, self.TRANSFORM_SIZE, self.TRANSFORM_MEAN, self.TRANSFORM_STD)
-        dino_output = self.dinov2.forward_features(batch_images)
-        batch_embeddings = torch.reshape(dino_output['x_norm_patchtokens'], [-1, self.PATCH_NUM, self.PATCH_NUM, self.EMBED_DIM]).permute(0, 3, 1, 2)
+            batch_images = resize_and_normalize_tensor(batch_images, self.TRANSFORM_SIZE, self.TRANSFORM_MEAN, self.TRANSFORM_STD)
+            dino_output = self.dinov2.forward_features(batch_images)
+            batch_embeddings = torch.reshape(dino_output['x_norm_patchtokens'], [-1, self.PATCH_NUM, self.PATCH_NUM, self.EMBED_DIM]).permute(0, 3, 1, 2)
 
         return batch_embeddings
         
@@ -54,6 +56,5 @@ if __name__ == '__main__':
     image_tensor = transform(image).to('cuda')
 
     vision_encoder = DinoV2().to('cuda')
-    with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-        embedding = vision_encoder(image_tensor.unsqueeze(0))
+    embedding = vision_encoder(image_tensor.unsqueeze(0))
     print(embedding.shape)

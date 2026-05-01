@@ -22,10 +22,9 @@ class Rollout(ObjectCentricLocalNavigation):
     
     def _predict(self, observation):
 
-        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-            with torch.no_grad():
-                output_logist, current_box, debug_info = self._model(observation, self._goal_images, self._prompt)
-                prediction = torch.argmax(output_logist, dim=2).flatten()
+        with torch.no_grad():
+            output_logist, current_box, debug_info = self._model(observation, self._goal_images, self._prompt)
+            prediction = torch.argmax(output_logist, dim=2).flatten()
 
         return prediction, current_box.squeeze(0), debug_info[0][0], debug_info[0][1]
 
@@ -130,6 +129,7 @@ if __name__ == '__main__':
     AUXILIARY_STOPPING = True
 
     # radii 1.0, 0.5
+    TRAJ_START_NUM = 0
     radii = [1.0]
     angles = [80, 50, 25, 0]
     # angles = [-25, -50, -80]
@@ -152,6 +152,7 @@ if __name__ == '__main__':
     sdk = bosdyn.client.create_standard_sdk('Rollout')
     robot = sdk.create_robot(options.hostname)
     bosdyn.client.util.authenticate(robot)
+    robot.time_sync.wait_for_sync()
     lease_client = robot.ensure_client(LeaseClient.default_service_name)
     
     rollout_graph_path = options.graph_path
@@ -168,12 +169,13 @@ if __name__ == '__main__':
     print(f'Target Object: {prompt}')
 
     try:
+        lease_client.take()
         with LeaseKeepAlive(lease_client, must_acquire=True, return_at_exit=True):
             try:
                 rollout_model = Rollout(MODEL, WEIGHT, robot, rollout_graph_path, auxiliary_stopping=AUXILIARY_STOPPING)
                 graph_navigator = GraphNavigator(robot, rollout_graph_path)
                 
-                traj_num = 0
+                traj_num = TRAJ_START_NUM
                 for rad in radii:
                     for ang in angles:
                         angle_in_radius = (ang / 180) * numpy.pi
@@ -204,7 +206,7 @@ if __name__ == '__main__':
                             traj_num += 1
                             time.sleep(1.5)
 
-            except Exception as exc:  # pylint: disable=broad-except
+            except Exception as exc:
                 print("Rollout threw an error.")
                 print(exc)
             finally:

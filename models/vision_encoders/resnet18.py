@@ -13,9 +13,11 @@ class Resnet18(torch.nn.Module):
         self.resnet18 = torch.nn.Sequential(*list(base_resnet.children())[:-2])
     
     def forward(self, batch_images):
+        with torch.autocast(device_type=batch_images.device.type, enabled=False):
+            batch_images = batch_images.float()
 
-        batch_images = self.TRANSFORMS(batch_images)
-        batch_embeddings= self.resnet18(batch_images)
+            batch_images = self.TRANSFORMS(batch_images)
+            batch_embeddings= self.resnet18(batch_images)
 
         return batch_embeddings
 

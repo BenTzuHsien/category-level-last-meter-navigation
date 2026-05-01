@@ -5,7 +5,7 @@ from Object_Centric_Local_Navigation.models.modules.utils import get_masked_regi
 class BaseModel(torch.nn.Module):
     IOU_THRESHOLD = 0.6
     COM_DIFF_X_THRESHOLD = 25
-    COM_DIFF_Y_THRESHOLD = 20
+    COM_DIFF_Y_THRESHOLD = 20   # currently unused: robot height is fixed, so Y stays roughly constant
 
     def __init__(self, vision_encoder, segmentation_model, action_decoder, use_embeddings=False, auxiliary_stopping=True):
         super().__init__()
@@ -59,8 +59,73 @@ class BaseModel(torch.nn.Module):
         com_diff_y = abs(com[1] - com_goal[1])
 
         return com_diff_x, com_diff_y
+    
+    def extract_embeddings(self, batch_images, prompts, previous_bounding_box=None):
+        """
+        Encode images, segment them, and produce pooled object centric embeddings.
+        
+        Parameters
+        ----------
+        batch_images : torch.Tensor
+            Batch of multi-view RGB images of shape `(B, N, C, H, W)`, where
+            `B` is the batch size and `N` is the number of camera views.
+        prompts : List[str]
+            Text prompts describing the target object, one per batch element.
+            Length must equal `B`.
+        previous_bounding_box : torch.Tensor or None, optional
+            A single reference bounding box of shape `(4,)` in `(x1, y1, x2, y2)`
+            format, used by the segmentation model to select the most temporally
+            consistent detection via highest IoU. If None, the highest confidence
+            detection is used. Defaults to None.
 
-    def forward(self, current_images, goal_images, furniture_prompt=None, previous_bounding_box=None):
+        Returns
+        -------
+        boxes : torch.Tensor
+            Bounding boxes of shape `(B, 4)` in `(x1, y1, x2, y2)` pixel
+            coordinates within the panoramic image. Rows are zeros for batch
+            elements where no detection was found.
+        masked_embeddings : torch.Tensor
+            Pooled object centric embeddings of shape `(B, C_out, 16, 16)`,
+            where `C_out` is the encoder embedding dimension. Computed by
+            masking the encoder features with the segmentation mask and
+            applying adaptive average pooling.
+        masks : torch.Tensor
+            Binary segmentation masks of shape `(B, 1, H, N*W)` in panoramic
+            layout. All zeros for batch elements where no detection was found.
+        panoramic : torch.Tensor
+            The panoramic RGB images of shape `(B, C, H, N*W)`, formed by
+            concatenating the `N` views horizontally. Returned for convenience
+            so callers can visualize masks against the original imagery without
+            recomputing the layout.
+        """
+        B, N, C, H, W = batch_images.shape
+        panoramic = batch_images.permute(0, 2, 3, 1, 4).reshape(B, C, H, N*W)
+
+        # Encode Images
+        batch_images = batch_images.reshape(B*N, C, H, W)
+        embeds = self.vision_encoder(batch_images)
+
+        _, C_out, H_out, W_out = embeds.shape
+        embeds = embeds.reshape(B, N, C_out, H_out, W_out)
+        embeds = embeds.permute(0, 2, 3, 1, 4).reshape(B, C_out, H_out, N*W_out)
+
+        # Segment Images
+        boxes, masks = self.segmentation_model(panoramic, prompts, previous_bounding_box)
+
+        embedding_masks = torch.nn.functional.interpolate(masks, [H_out, N*W_out], mode="nearest")
+        embedding_boxes = get_masked_region(embedding_masks)
+
+        masked_embeddings = []
+        for i in range(B):
+            x1, y1, x2, y2 = embedding_boxes[i]
+            masked_embeds = embedding_masks[i][:, y1:y2+1, x1:x2+1] * embeds[i][:, y1:y2+1, x1:x2+1]
+            masked_embeds = self.avg_pool(masked_embeds)
+            masked_embeddings.append(masked_embeds)
+        masked_embeddings = torch.stack(masked_embeddings)
+
+        return boxes, masked_embeddings, masks, panoramic
+
+    def forward(self, current_images, goal_images, target_prompt=None, previous_bounding_box=None):
         """
         Forward pass of the model.
 
@@ -78,8 +143,8 @@ class BaseModel(torch.nn.Module):
                 A `torch.Tensor` of shape `(B, N, C, H, W)` containing raw RGB images for the goal state.
             If `self.use_embeddings` is True:
                 A `Tuple` containing precomputed embeddings and bounding boxes. The format is `(goal_boxes, goal_embeddings)`.
-        furniture_prompt : str, optional
-            A text prompt describing the target furniture. This parameter is not used
+        target_prompt : str, optional
+            A text prompt describing the target object. This parameter is not used
             when `use_embeddings` is True, as the segmentation model is bypassed. Defaults to None.
         previous_bounding_box : torch.Tensor or None, optional
             A single reference bounding box (shape: (4,)) in (x1, y1, x2, y2) format, used to select the most 
@@ -87,74 +152,29 @@ class BaseModel(torch.nn.Module):
 
         Returns
         -------
-        action : torch.Tensor
-            A tensor of shape `(B, 3, 3)` representing the predicted action. It includes
-            3-class predictions over x, y, and rotation.
+        actions : torch.Tensor
+            Predicted actions of shape `(B, 3, 3)`, containing 3-class logits over x translation, y translation, and rotation.
         current_boxes : torch.Tensor
             The bounding boxes detected in the current images.
-        debug_info : Tuple[Tuple[List[Optional[torch.Tensor]], List[Optional[torch.Tensor]]], Any]
-            A tuple containing debugging information.
-            - The first element is a tuple of lists containing masks for current and goal images.
-            - The second element contains additional debugging information from the action decoder.
+        debug_info : Tuple[Tuple[Optional[torch.Tensor], Optional[torch.Tensor]], Any]
+            Auxiliary outputs for debugging and visualization.
+            - The first element is `(current_masks, goal_masks)`, each a tensor of
+            shape `(B, 1, H, N*W)` in panoramic layout, or `None` when `use_embeddings=True` (since segmentation is bypassed).
+            - The second element is debugging information returned by the action
+            decoder; its structure depends on the decoder implementation.
         """
         current_masks, goal_masks = None, None
         if not self.use_embeddings:
-            B, N, C, H, W = current_images.shape
-            prompts = [furniture_prompt] * B
-        
+            B = current_images.shape[0]
+            prompts = [target_prompt] * B
+
             # Process goal images
-            goal_panoramic = goal_images.permute(0, 2, 3, 1, 4).reshape(B, C, H, N * W)
-            
-            ## Encode goal images
-            goal_images = goal_images.reshape(B*N, C, H, W)
-            goal_embeds = self.vision_encoder(goal_images)
-
-            _, C_out, H_out, W_out = goal_embeds.shape
-            goal_embeds = goal_embeds.reshape(B, N, C_out, H_out, W_out)
-            goal_embeds = goal_embeds.permute(0, 2, 3, 1, 4).reshape(B, C_out, H_out, N * W_out)
-
-            ## Segment goal imgaes
-            goal_boxes, goal_masks = self.segmentation_model(goal_panoramic, prompts)
-
-            embedding_masks = torch.nn.functional.interpolate(goal_masks, [H_out, N * W_out], mode="nearest")
-            embedding_boxes = get_masked_region(embedding_masks)
-
-            goal_embeddings = []
-            for i in range(B):
-                x1, y1, x2, y2 = embedding_boxes[i]
-                masked_embeddings = embedding_masks[i][:, y1:y2+1, x1:x2+1] * goal_embeds[i][:, y1:y2+1, x1:x2+1]
-                masked_embeddings = self.avg_pool(masked_embeddings)
-                goal_embeddings.append(masked_embeddings)
-            goal_embeddings = torch.stack(goal_embeddings)
-
-            # ----- Output: goal_boxes, goal_embeddings -----
+            goal_boxes, goal_embeddings, goal_masks, _ = self.extract_embeddings(goal_images, prompts)
 
             # Process current images
-            current_panoramic = current_images.permute(0, 2, 3, 1, 4).reshape(B, C, H, N * W)
-
-            ## Encode current images
-            current_images = current_images.reshape(B*N, C, H, W)
-            current_embeds = self.vision_encoder(current_images)
-
-            _, C_out, H_out, W_out = current_embeds.shape
-            current_embeds = current_embeds.reshape(B, N, C_out, H_out, W_out)
-            current_embeds = current_embeds.permute(0, 2, 3, 1, 4).reshape(B, C_out, H_out, N * W_out)
-
-            ## Segment current images
-            current_boxes, current_masks = self.segmentation_model(current_panoramic, prompts, previous_bounding_box)
-
-            embedding_masks = torch.nn.functional.interpolate(current_masks, [H_out, N * W_out], mode="nearest")
-            embedding_boxes = get_masked_region(embedding_masks)
-
-            current_embeddings = []
-            for i in range(B):
-                x1, y1, x2, y2 = embedding_boxes[i]
-                masked_embeddings = embedding_masks[i][:, y1:y2+1, x1:x2+1] * current_embeds[i][:, y1:y2+1, x1:x2+1]
-                masked_embeddings = self.avg_pool(masked_embeddings)
-                current_embeddings.append(masked_embeddings)
-            current_embeddings = torch.stack(current_embeddings)
-
-            # ----- Output: current_boxes, current_embeddings
+            current_boxes, current_embeddings, current_masks, _ = self.extract_embeddings(current_images, prompts, previous_bounding_box)
+            
+            # Action Decoder
             actions, decoder_debug_info = self.action_decoder(current_boxes, current_embeddings, goal_boxes, goal_embeddings)
 
             if self.auxiliary_stopping:
@@ -164,7 +184,7 @@ class BaseModel(torch.nn.Module):
 
                     print(f'iou: {iou}, com diff: {com_diff_x}, {com_diff_y}')
 
-                    if iou > self.IOU_THRESHOLD and com_diff_x < self.COM_DIFF_X_THRESHOLD and com_diff_y < self.COM_DIFF_Y_THRESHOLD:
+                    if iou > self.IOU_THRESHOLD and com_diff_x < self.COM_DIFF_X_THRESHOLD:
                         print('auxiliary succeed!')
                         actions[i] = torch.tensor([[0, 1, 0], [0, 1, 0], [0, 1, 0]])
         
@@ -216,7 +236,6 @@ if __name__ == '__main__':
     # weight_path = ''
     # model.load_weights(weight_path)
 
-    with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-        output, current_boxes, debug_info = model(current_images.unsqueeze(0), goal_images.unsqueeze(0), prompt)
+    output, current_boxes, debug_info = model(current_images.unsqueeze(0), goal_images.unsqueeze(0), prompt)
     output = torch.argmax(output, dim=2)
     print(f'Output: {output}, Box:{current_boxes}')

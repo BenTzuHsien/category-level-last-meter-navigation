@@ -50,9 +50,11 @@ if __name__ == '__main__':
     sdk = bosdyn.client.create_standard_sdk('TrajectoryReplayer')
     robot = sdk.create_robot(options.hostname)
     bosdyn.client.util.authenticate(robot)
+    robot.time_sync.wait_for_sync()
     lease_client = robot.ensure_client(LeaseClient.default_service_name)
 
     try:
+        lease_client.take()
         with LeaseKeepAlive(lease_client, must_acquire=True, return_at_exit=True):
             try:
                 
@@ -84,7 +86,7 @@ if __name__ == '__main__':
                             # Evaluate
                             trajectory_replayer.evaluate()
 
-            except Exception as exc:  # pylint: disable=broad-except
+            except Exception as exc:
                 print("TrajectoryReplayer threw an error.")
                 print(exc)
             finally:
