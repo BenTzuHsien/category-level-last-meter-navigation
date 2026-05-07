@@ -59,6 +59,6 @@ if __name__ == '__main__':
     try:
         get_goal_condition.record_goal()
 
-    except Exception as exc:  # pylint: disable=broad-except
+    except Exception as exc:
         print("GetGoalCondition threw an error.")
         print(exc)

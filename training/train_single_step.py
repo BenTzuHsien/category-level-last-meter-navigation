@@ -17,13 +17,11 @@ def evaluation(model, dataloader, device):
         goal_embedding = goal_embedding.to(device)
         action = action.to(device)
 
-        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-            output, _, _ = model((current_box, current_embedding), (goal_box, goal_embedding), prompt)
+        output, _, _ = model((current_box, current_embedding), (goal_box, goal_embedding), prompt)
         prediction = torch.argmax(output, dim=2)
 
-        prediction_mask = torch.all(prediction == action, dim=1)
-        num_total += prediction_mask.shape[0]
-        num_correct += prediction_mask.sum().item()
+        num_correct += torch.all(prediction == action, dim=1).sum().item()
+        num_total += action.shape[0]
 
     accuracy = (num_correct / num_total) * 100
     return accuracy
@@ -32,7 +30,7 @@ def train_single_step(model, dataset_paths, evaluation_path, result_path, num_gp
     PARAM = {
         'Batch_Size': 32,
         'Learning_Rate': 1e-4,
-        'Num_Epochs': 500,
+        'Num_Epochs': 1000,
         'Weight_Saving_Step': 10
     }
 
@@ -45,6 +43,10 @@ def train_single_step(model, dataset_paths, evaluation_path, result_path, num_gp
     os.makedirs(result_path, exist_ok=True)
     weight_save_dir = os.path.join(result_path, 'weights')
     os.makedirs(weight_save_dir, exist_ok=True)
+    scheduler_save_dir = os.path.join(result_path, 'schedulers')
+    os.makedirs(scheduler_save_dir, exist_ok=True)
+    optimizer_save_dir = os.path.join(result_path, 'optimizers')
+    os.makedirs(optimizer_save_dir, exist_ok=True)
     training_losses_path = os.path.join(result_path, 'training_losses.npy')
     training_accuracies_path = os.path.join(result_path, 'training_accuracies.npy')
     evaluation_accuracies_path = os.path.join(result_path, 'evaluation_accuracies.npy')
@@ -64,7 +66,7 @@ def train_single_step(model, dataset_paths, evaluation_path, result_path, num_gp
     # Setup evaluation dataset
     print('Loading Evaluation Dataset...')
     evaluation_dataset = SingleStepDataset(evaluation_path)
-    evaluation_dataloader = DataLoader(evaluation_dataset, batch_size=1, shuffle=False, num_workers=16, pin_memory=True)
+    evaluation_dataloader = DataLoader(evaluation_dataset, batch_size=16, shuffle=False, num_workers=16, pin_memory=True)
 
     # Setup model and device
     if num_gpus > 1:
@@ -82,11 +84,31 @@ def train_single_step(model, dataset_paths, evaluation_path, result_path, num_gp
         model = model.to(DEVICE)
     model.train()
 
+    # Setup loss function and optimizer
+    loss_fn = torch.nn.CrossEntropyLoss()
+    optimizer = torch.optim.Adam(model.parameters(), lr=PARAM['Learning_Rate'])
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer,
+        mode='max',
+        factor=0.5, 
+        patience=30,
+        threshold=1e-2,
+        min_lr=1e-7
+    )
+
     # Resume previous training
     if start_index > 1:
         weight_path = os.path.join(result_path, 'weights', f'{start_index}.pth')
-        model.load_weight(weight_path)
+        model.load_weights(weight_path)
         print('Weight Loaded!')
+
+        scheduler_path = os.path.join(result_path, 'schedulers', f'{start_index}.pth')
+        scheduler.load_state_dict(torch.load(scheduler_path))
+        print('Scheduler Loaded!')
+
+        optimizer_path = os.path.join(result_path, 'optimizers', f'{start_index}.pth')
+        optimizer.load_state_dict(torch.load(optimizer_path, map_location=DEVICE))
+        print('Optimizer Loaded!')
 
         training_losses = list(numpy.load(training_losses_path))[:start_index-1]
         training_losses_path = os.path.join(result_path, 'new_training_losses.npy')
@@ -97,15 +119,13 @@ def train_single_step(model, dataset_paths, evaluation_path, result_path, num_gp
         print('Tracking Parameter Loaded!')
     start_index -= 1
 
-    # Setup loss function and optimizer
-    loss_fn = torch.nn.CrossEntropyLoss()
-    optimizer = torch.optim.Adam(model.parameters(), lr=PARAM['Learning_Rate'])
-
     # Training
     training_bar = tqdm(range(start_index, PARAM['Num_Epochs']), desc=f'Training {model.__class__.__name__}, Epochs')
     for epoch in training_bar:
 
-        running_loss = 0.0
+        running_loss = torch.zeros((), device=DEVICE)
+        num_correct = torch.zeros((), device=DEVICE, dtype=torch.long)
+        num_total = 0
         for current_box, current_embedding, goal_box, goal_embedding, action, prompt in tqdm(train_dataloader, desc="Training", leave=False):
 
             current_box = current_box.to(DEVICE)
@@ -115,32 +135,54 @@ def train_single_step(model, dataset_paths, evaluation_path, result_path, num_gp
             action = action.to(DEVICE)
 
             optimizer.zero_grad()
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                output, _, _ = model((current_box, current_embedding), (goal_box, goal_embedding), prompt)
-                output = output.permute(0, 2, 1)   # To accomadate how CrossEnropyLoss function accept as input (Batch_size, Num_classes, ...)
-                loss = loss_fn(output, action)
+            output, _, _ = model((current_box, current_embedding), (goal_box, goal_embedding), prompt)
+            output = output.permute(0, 2, 1)   # To accomadate how CrossEnropyLoss function accept as input (Batch_size, Num_classes, ...)
+            loss = loss_fn(output, action)
 
+            # Calculate Loss
             loss.backward()
             optimizer.step()
-            running_loss += loss.item()
+            running_loss += loss.detach()
 
-        training_loss = running_loss / len(train_dataloader)
+            # Calculate Accuracy
+            prediction = torch.argmax(output, dim=1)
+            num_correct += torch.all(prediction == action, dim=1).sum()
+            num_total += action.shape[0]
+
+        # Calculate Loss
+        training_loss = (running_loss / len(train_dataloader)).item()
         training_losses.append([epoch+1, training_loss])
-        training_bar.set_description(f'Training {model.__class__.__name__}, loss={training_loss:.4f}, Epochs')
+        
+        # Calculate Accuracy
+        train_acc = (num_correct.item() / num_total) * 100
+        scheduler.step(train_acc)
+
+        training_bar.set_description(f'Training {model.__class__.__name__}, loss={training_loss:.4f}, accuracy={train_acc:.2f}, Epochs')
 
         # Checkpoint
         if ((epoch + 1) % PARAM['Weight_Saving_Step']) == 0:
+
+            training_accuracies.append([epoch+1, train_acc])
+            tqdm.write(f'Training Accuracy: {train_acc}')
+
+            eval_acc = evaluation(model, evaluation_dataloader, DEVICE)
+            tqdm.write(f'Evaluation Accuracy: {eval_acc}')
+            evaluation_accuracies.append([epoch+1, eval_acc])
+
+            # Save Weight
             weight_save_path = os.path.join(weight_save_dir, f'{epoch+1}.pth')
             torch.save(model.state_dict(), weight_save_path)
             tqdm.write(f'Save Weight {epoch+1}!')
 
-            accuracy = evaluation(model, train_dataloader, DEVICE)
-            tqdm.write(f'Training Accuracy: {accuracy}')
-            training_accuracies.append([epoch+1, accuracy])
+            # Save Scheduler
+            scheduler_save_path = os.path.join(scheduler_save_dir, f'{epoch+1}.pth')
+            torch.save(scheduler.state_dict(), scheduler_save_path)
+            tqdm.write(f'Save Scheduler {epoch+1}!')
 
-            accuracy = evaluation(model, evaluation_dataloader, DEVICE)
-            tqdm.write(f'Evaluation Accuracy: {accuracy}')
-            evaluation_accuracies.append([epoch+1, accuracy])
+            # Save Optimizer
+            optimizer_save_path = os.path.join(optimizer_save_dir, f'{epoch+1}.pth')
+            torch.save(optimizer.state_dict(), optimizer_save_path)
+            tqdm.write(f'Save Optimizer {epoch+1}!')
 
             # Save parameters
             numpy.save(training_losses_path, training_losses)
@@ -151,17 +193,28 @@ def train_single_step(model, dataset_paths, evaluation_path, result_path, num_gp
     print('Finished Training !')
     
     if PARAM['Num_Epochs'] % PARAM['Weight_Saving_Step'] != 0:
-        weight_save_path = os.path.join(weight_save_dir, f'{PARAM["Num_Epochs"]}.pth')
+
+        training_accuracies.append([PARAM['Num_Epochs'], train_acc])
+        tqdm.write(f'Training Accuracy: {train_acc}')
+
+        eval_acc = evaluation(model, evaluation_dataloader, DEVICE)
+        print(f'Evaluation Accuracy: {eval_acc}')
+        evaluation_accuracies.append([PARAM['Num_Epochs'], eval_acc])
+
+        # Save Weight
+        weight_save_path = os.path.join(weight_save_dir, f'{epoch+1}.pth')
         torch.save(model.state_dict(), weight_save_path)
-        print(f'Save Weight {PARAM["Num_Epochs"]}!')
+        tqdm.write(f'Save Weight {epoch+1}!')
 
-        accuracy = evaluation(model, train_dataloader, DEVICE)
-        print(f'Training Accuracy: {accuracy}')
-        training_accuracies.append([PARAM['Num_Epochs'], accuracy])
+        # Save Scheduler
+        scheduler_save_path = os.path.join(scheduler_save_dir, f'{epoch+1}.pth')
+        torch.save(scheduler.state_dict(), scheduler_save_path)
+        tqdm.write(f'Save Scheduler {epoch+1}!')
 
-        accuracy = evaluation(model, evaluation_dataloader, DEVICE)
-        print(f'Evaluation Accuracy: {accuracy}')
-        evaluation_accuracies.append([PARAM['Num_Epochs'], accuracy])
+        # Save Optimizer
+        optimizer_save_path = os.path.join(optimizer_save_dir, f'{epoch+1}.pth')
+        torch.save(optimizer.state_dict(), optimizer_save_path)
+        tqdm.write(f'Save Optimizer {epoch+1}!')
 
         # Save parameters
         numpy.save(training_losses_path, training_losses)
