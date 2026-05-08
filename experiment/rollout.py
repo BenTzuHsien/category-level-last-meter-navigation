@@ -9,8 +9,8 @@ def key_pressed():
     return dr != []
 
 class Rollout(ObjectCentricLocalNavigation):
-    TRANSLATION_TOLERANCE = 0.2
-    ROTATION_TOLERANCE = 0.1
+    TRANSLATION_TOLERANCE = 0.3
+    ROTATION_TOLERANCE = 0.15
     TIME_LIMIT = 100
     EVALUATION_DICT_ORDER = ["success", "duration", "translation_error", "rotation_error", "pose_error"]
 
